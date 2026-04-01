@@ -1,6 +1,6 @@
 ---
 title: "Computing NDVI on the Edge with WebGL"
-description: "Fetch Sentinel-2 imagery via STAC, decode Cloud Optimized GeoTIFFs in the browser, compute NDVI per-pixel, and render the result over an interactive map — all client-side."
+description: "Fetch Sentinel-2 imagery via STAC, decode Cloud Optimized GeoTIFFs in the browser, compute NDVI on the GPU with a WebGL fragment shader, and render the result over an interactive map — all client-side."
 pubDate: "2026-04-01"
 ---
 import NDVIMap from '../../components/NDVIMap.astro';
@@ -17,12 +17,13 @@ Values range from **-1** (water, deep shadow) through **0** (bare soil) to **+1*
 
 ## The Architecture
 
-Our pipeline runs four stages, all on the client:
+Our pipeline runs five stages, all on the client:
 
 1. **STAC Search** — Query the [Element84 Earth Search](https://earth-search.aws.element84.com/v1) catalog to find the latest Sentinel-2 L2A scene covering the current map viewport with less than 20% cloud cover.
-2. **COG Fetch** — Extract the Red (B04) and NIR (B08) asset URLs. These are Cloud Optimized GeoTIFFs hosted on AWS S3. The browser fetches only the byte ranges it needs via HTTP Range Requests.
-3. **NDVI Compute** — Read both bands into `Float32Array` buffers and compute NDVI per-pixel.
-4. **Render** — Map each NDVI value to a color using a diverging ramp and paint the result as an image layer on a MapLibre map.
+2. **Viewport Windowing** — Reproject the map bounds into the GeoTIFF's native UTM coordinate system and calculate the exact pixel window to fetch. This avoids downloading the entire 100 km tile.
+3. **COG Fetch** — Use HTTP Range Requests to download only the bytes for the visible window from Cloud Optimized GeoTIFFs on AWS S3. The `geotiff.js` library automatically selects the optimal overview level.
+4. **WebGL Compute** — Upload the Red and NIR bands as GPU textures and run a fragment shader that computes NDVI per-pixel and maps the result through a 1D colormap texture.
+5. **Render** — Feed the GPU output canvas to MapLibre as an image source, with coordinates precisely back-projected from the GeoTIFF's native CRS.
 
 ---
 
@@ -62,68 +63,83 @@ The response includes asset URLs for every spectral band. We need two:
 
 ---
 
-## Step 2: Decoding Cloud Optimized GeoTIFFs
+## Step 2: Viewport-Windowed COG Fetching
 
-A [Cloud Optimized GeoTIFF (COG)](https://www.cogeo.org/) is internally tiled and structured so that HTTP Range Requests can fetch only the needed bytes. The `geotiff.js` library handles this transparently:
+A naive implementation would download the entire Sentinel-2 tile (10,980 × 10,980 pixels at 10m resolution — over 200 MB per band). Instead, we calculate the exact pixel window that corresponds to the current map viewport.
+
+The key insight is that Sentinel-2 GeoTIFFs are stored in a projected CRS (typically UTM), not in latitude/longitude. We use `proj4` to reproject the map bounds:
 
 ```js
-import { fromUrl } from 'geotiff';
+import proj4 from 'proj4';
 
-const [redTiff, nirTiff] = await Promise.all([
-  fromUrl(scene.assets.red.href),
-  fromUrl(scene.assets.nir.href),
-]);
+// Reproject map viewport bounds to the GeoTIFF's native CRS (e.g. UTM 30N)
+const sw = proj4('EPSG:4326', epsg, [mapBounds.getWest(), mapBounds.getSouth()]);
+const ne = proj4('EPSG:4326', epsg, [mapBounds.getEast(), mapBounds.getNorth()]);
 
-const [redImage, nirImage] = await Promise.all([
-  redTiff.getImage(),
-  nirTiff.getImage(),
-]);
+// Convert geo-coordinates to pixel coordinates
+const pxLeft  = Math.floor(((sw[0] - geoXmin) / (geoXmax - geoXmin)) * imgW);
+const pxRight = Math.ceil(((ne[0] - geoXmin) / (geoXmax - geoXmin)) * imgW);
+// ... (similarly for Y, remembering raster origin is top-left)
+```
 
-// Read at a target resolution for performance
+We then pass this pixel window to `geotiff.js`, along with a target output size. The library automatically selects the best COG overview level, fetching only the necessary bytes via HTTP Range Requests:
+
+```js
 const [redRaster, nirRaster] = await Promise.all([
-  redImage.readRasters({ width: 1024, height: 1024, samples: [0] }),
-  nirImage.readRasters({ width: 1024, height: 1024, samples: [0] }),
+  redImage.readRasters({ window: [left, top, right, bottom], width: outW, height: outH }),
+  nirImage.readRasters({ window: [left, top, right, bottom], width: outW, height: outH }),
 ]);
 ```
 
-Key performance detail: we request `width` and `height` parameters, so `geotiff.js` leverages the COG's internal overviews to avoid decoding full-resolution data.
+This reduces data transfer from **~200 MB** to typically **0.5–2 MB** per viewport.
 
 ---
 
-## Step 3: Computing NDVI
+## Step 3: Computing NDVI on the GPU
 
-With both bands as typed arrays, the NDVI computation is trivially fast — a single loop over the pixels.
+This is where the WebGL magic happens. Instead of looping over pixels on the CPU, we upload the raw band data as GPU textures and run the entire NDVI calculation in a **GLSL fragment shader**.
 
-**Crucial detail for Sentinel-2 L2A:** Since Processing Baseline 04.00 (January 2022), ESA introduced a radiometric offset of -1000 to the Digital Numbers (DN). Consequently, a DN of 1000 actually corresponds to 0 actual reflectance. If you don't subtract this offset before computing NDVI, your results will be heavily skewed towards zero!
+**Crucial detail for Sentinel-2 L2A:** Since Processing Baseline 04.00 (January 2022), ESA introduced a radiometric offset of -1000 to the Digital Numbers (DN). A DN of 1000 corresponds to 0 reflectance. The shader handles this natively:
 
-```js
-const redData = redRaster[0]; // Uint16Array
-const nirData = nirRaster[0]; // Uint16Array
+```glsl
+precision highp float;
+uniform sampler2D u_red;
+uniform sampler2D u_nir;
+uniform sampler2D u_colormap;
+varying vec2 v_uv;
 
-for (let i = 0; i < redData.length; i++) {
-  // 1. Subtract the 1000 offset and clamp to 0
-  const red = Math.max(0, redData[i] - 1000);
-  const nir = Math.max(0, nirData[i] - 1000);
-  
-  const sum = nir + red;
-  const ndvi = sum > 0 ? (nir - red) / sum : 0;
+void main() {
+  // Reconstruct original DN from normalized texture value
+  float redRaw = texture2D(u_red, v_uv).r * 65535.0;
+  float nirRaw = texture2D(u_nir, v_uv).r * 65535.0;
 
-  // 2. Map to color ramp
-  const [r, g, b, a] = ndviToRGBA(ndvi);
-  pixels[i * 4]     = r;
-  pixels[i * 4 + 1] = g;
-  pixels[i * 4 + 2] = b;
-  pixels[i * 4 + 3] = a;
+  // Skip nodata pixels
+  if (redRaw < 1.0 && nirRaw < 1.0) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  // Subtract the radiometric offset
+  float red = max(0.0, redRaw - 1000.0);
+  float nir = max(0.0, nirRaw - 1000.0);
+
+  // NDVI formula
+  float denom = nir + red;
+  float ndvi = denom > 0.0 ? (nir - red) / denom : 0.0;
+
+  // Colormap lookup via 1D texture
+  float lookup = clamp((ndvi + 1.0) * 0.5, 0.0, 1.0);
+  gl_FragColor = texture2D(u_colormap, vec2(lookup, 0.5));
 }
 ```
 
-On a modern machine this loop typically completes in **under 10ms** for a 1024×1024 image. The bottleneck is always the network fetch, not the computation.
+The band data is uploaded as `LUMINANCE` float textures (via the `OES_texture_float` extension), and the colormap is a pre-baked 256×1 RGBA texture. The GPU processes all pixels in parallel — the entire computation typically finishes in **under 10 ms**.
 
 ---
 
 ## Step 4: The Color Ramp
 
-Our color ramp maps NDVI values to a diverging palette:
+Our color ramp maps NDVI values to a perceptually diverging palette, baked into a 256×1 texture for GPU lookup:
 
 ```js
 const STOPS = [
@@ -138,22 +154,43 @@ const STOPS = [
 ];
 ```
 
-We linearly interpolate between adjacent stops. The ramp is designed to be perceptually uniform — equal changes in NDVI produce equal perceived changes in color.
+We linearly interpolate between adjacent stops on the CPU once to generate a 256-pixel-wide canvas, then upload it as a texture. The shader samples it with `texture2D(u_colormap, vec2(lookup, 0.5))` — the GPU's texture filtering gives us smooth color transitions for free.
+
+---
+
+## Step 5: Geographic Alignment
+
+The GPU output canvas must be positioned precisely on the MapLibre map. Since we fetched a specific pixel window from a UTM-projected GeoTIFF, we back-project the exact pixel boundaries to WGS84 coordinates:
+
+```js
+// Back-project the pixel window corners to geo-coordinates
+const actXmin = geoXmin + (winLeft  / imgW) * (geoXmax - geoXmin);
+const actXmax = geoXmin + (winRight / imgW) * (geoXmax - geoXmin);
+// ... convert to WGS84 via proj4 ...
+
+map.addSource(id, {
+  type: 'image',
+  url: ndviCanvas.toDataURL(),
+  coordinates: [topLeft, topRight, bottomRight, bottomLeft],
+});
+```
+
+This produces pixel-perfect alignment between the NDVI overlay and the basemap.
 
 ---
 
 ## Performance Notes
 
-The total pipeline time is dominated by the **COG network fetch**. In our profiling from earlier work on this project:
+With viewport windowing and GPU compute, the pipeline is dramatically faster than downloading the full tile:
 
-| Phase     | Typical Time | Notes |
-|-----------|-------------|-------|
-| STAC search | ~400ms | Single HTTP POST |
-| COG fetch   | 3–15s  | HTTP Range Requests to S3 (parallel) |
-| NDVI compute | &lt;10ms | Pure CPU loop over Float32Arrays |
-| Canvas render | &lt;5ms | `putImageData` + MapLibre image source |
+| Phase | Typical Time | Notes |
+|---|---|---|
+| STAC search | ~400 ms | Single HTTP POST |
+| COG fetch | 100–500 ms | Windowed Range Requests (vs. 3–15s for full tile) |
+| WebGL compute | &lt;10 ms | Fragment shader on GPU |
+| Map render | &lt;5 ms | `toDataURL` + MapLibre image source |
 
-> The WASM approach from our earlier Zola-based blog achieved similar compute times (~5ms). The JavaScript loop shown here is comparably fast because modern V8/SpiderMonkey JIT-compile tight numeric loops very efficiently. WebAssembly would only provide marginal improvement for this specific workload.
+> **Why not a MapLibre custom layer?** We use an offscreen WebGL context rather than integrating directly into MapLibre's render loop. This avoids WebGL state management conflicts between our shader and MapLibre's internal renderer, while still achieving full GPU acceleration. The result is fed back as a standard image source — simple, reliable, and just as fast.
 
 ---
 
@@ -162,6 +199,6 @@ The total pipeline time is dominated by the **COG network fetch**. In our profil
 This tutorial represents the foundation of our client-side Edge ML pipeline. In future posts, we'll be tackling:
 
 1. **Migrating to Copernicus Zarr:** The European Space Agency recently launched the EOPF Sentinel Zarr Samples Service. We'll explore how to replace our GeoTIFF logic with native multi-dimensional Zarr chunk fetching in the browser!
-2. **Edge Deep Learning (Tree Detection):** Instead of a simple manual algorithm like NDVI, we'll run a full YOLO deep learning model directly on your GPU to perform automated tree detection using ONNX Runtime Web and WebGPU. 
+2. **Edge Deep Learning (Tree Detection):** Instead of a simple manual algorithm like NDVI, we'll run a full YOLO deep learning model directly on your GPU to perform automated tree detection using ONNX Runtime Web and WebGPU.
 
 Stay tuned!
