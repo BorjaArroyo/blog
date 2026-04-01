@@ -76,7 +76,7 @@ const latestPost = posts[0];
 					Learn how to deploy classical computer vision algorithms and deep learning models directly in the browser, achieving zero-server-cost inference and maximum privacy.
 				</p>
 				<div class="cta-buttons">
-					<a href={`${import.meta.env.BASE_URL}/tutorials`} class="btn-primary">Browse Tutorials</a>
+					<a href={`${import.meta.env.BASE_URL}tutorials`} class="btn-primary">Browse Tutorials</a>
 					{latestPost && <a href={`${import.meta.env.BASE_URL}tutorials/${latestPost.id}`} class="btn-secondary">Read Latest</a>}
 				</div>
 			</section>
@@ -85,7 +85,7 @@ const latestPost = posts[0];
 				<section class="latest-tutorial">
 					<h3>Featured Tutorial</h3>
 					<div class="glass-panel">
-						<h2><a href={`${import.meta.env.BASE_URL}/tutorials/${latestPost.id}`}>{latestPost.data.title}</a></h2>
+						<h2><a href={`${import.meta.env.BASE_URL}tutorials/${latestPost.id}`}>{latestPost.data.title}</a></h2>
 						<p>{latestPost.data.description}</p>
 					</div>
 				</section>
