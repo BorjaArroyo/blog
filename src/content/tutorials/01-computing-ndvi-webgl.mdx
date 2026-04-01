@@ -92,17 +92,23 @@ Key performance detail: we request `width` and `height` parameters, so `geotiff.
 
 ## Step 3: Computing NDVI
 
-With both bands as typed arrays, the NDVI computation is trivially fast — a single loop over the pixels:
+With both bands as typed arrays, the NDVI computation is trivially fast — a single loop over the pixels.
+
+**Crucial detail for Sentinel-2 L2A:** Since Processing Baseline 04.00 (January 2022), ESA introduced a radiometric offset of -1000 to the Digital Numbers (DN). Consequently, a DN of 1000 actually corresponds to 0 actual reflectance. If you don't subtract this offset before computing NDVI, your results will be heavily skewed towards zero!
 
 ```js
-const red = redRaster[0]; // Float32Array
-const nir = nirRaster[0]; // Float32Array
+const redData = redRaster[0]; // Uint16Array
+const nirData = nirRaster[0]; // Uint16Array
 
-for (let i = 0; i < red.length; i++) {
-  const sum = nir[i] + red[i];
-  const ndvi = sum > 0 ? (nir[i] - red[i]) / sum : 0;
+for (let i = 0; i < redData.length; i++) {
+  // 1. Subtract the 1000 offset and clamp to 0
+  const red = Math.max(0, redData[i] - 1000);
+  const nir = Math.max(0, nirData[i] - 1000);
+  
+  const sum = nir + red;
+  const ndvi = sum > 0 ? (nir - red) / sum : 0;
 
-  // Map to color ramp
+  // 2. Map to color ramp
   const [r, g, b, a] = ndviToRGBA(ndvi);
   pixels[i * 4]     = r;
   pixels[i * 4 + 1] = g;
@@ -151,6 +157,11 @@ The total pipeline time is dominated by the **COG network fetch**. In our profil
 
 ---
 
-## What's Next
+## Roadmap: What's Next?
 
-In the [next tutorial](/tutorials/02-edge-tree-detection), we take this a step further: instead of a simple arithmetic formula, we run a full **YOLO deep learning model** for tree detection directly in the browser using WebGPU and ONNX Runtime Web.
+This tutorial represents the foundation of our client-side Edge ML pipeline. In future posts, we'll be tackling:
+
+1. **Migrating to Copernicus Zarr:** The European Space Agency recently launched the EOPF Sentinel Zarr Samples Service. We'll explore how to replace our GeoTIFF logic with native multi-dimensional Zarr chunk fetching in the browser!
+2. **Edge Deep Learning (Tree Detection):** Instead of a simple manual algorithm like NDVI, we'll run a full YOLO deep learning model directly on your GPU to perform automated tree detection using ONNX Runtime Web and WebGPU. 
+
+Stay tuned!

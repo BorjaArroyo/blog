@@ -7,6 +7,7 @@
  * 4. Render as image overlay on MapLibre basemap
  */
 import maplibregl from 'maplibre-gl';
+import proj4 from 'proj4';
 import { ndviToRGBA } from './ndvi-colormap.js';
 
 // ─── Configuration ──────────────────────────────────────────────
@@ -84,10 +85,32 @@ function getBandUrl(scene, band) {
   return asset.href;
 }
 
-// ─── Extract scene bounding box in EPSG:4326 ───────────────────
-function getSceneBBox(scene) {
-  // STAC items always have a bbox in [west, south, east, north] EPSG:4326
-  return scene.bbox;
+// ─── Reproject GeoTIFF native corners to WGS84 ──────────────────
+async function getProjectedCoordinates(image) {
+  const geoKeys = image.getGeoKeys();
+  const epsgStr = geoKeys.ProjectedCSTypeGeoKey;
+  if (!epsgStr) throw new Error('Could not find ProjectedCSTypeGeoKey in GeoTIFF');
+  const epsgCode = `EPSG:${epsgStr}`;
+
+  if (!proj4.defs(epsgCode)) {
+    // Fetch proj4 definition from epsg.io
+    const res = await fetch(`https://epsg.io/${epsgStr}.proj4`);
+    if (!res.ok) throw new Error(`Failed to fetch proj4 def for EPSG ${epsgStr}`);
+    const proj4String = await res.text();
+    proj4.defs(epsgCode, proj4String);
+  }
+
+  // Native corners in original CRS (e.g. UTM)
+  const [minX, minY, maxX, maxY] = image.getBoundingBox();
+
+  // Project the 4 exact corners to WGS84 (EPSG:4326)
+  // MapLibre requires: [top-left, top-right, bottom-right, bottom-left]
+  const tl = proj4(epsgCode, 'EPSG:4326', [minX, maxY]);
+  const tr = proj4(epsgCode, 'EPSG:4326', [maxX, maxY]);
+  const br = proj4(epsgCode, 'EPSG:4326', [maxX, minY]);
+  const bl = proj4(epsgCode, 'EPSG:4326', [minX, minY]);
+
+  return [tl, tr, br, bl];
 }
 
 // ─── Initialize Map ─────────────────────────────────────────────
@@ -191,15 +214,20 @@ async function loadNDVI() {
     const computeT0 = performance.now();
 
     for (let i = 0; i < redData.length; i++) {
-      const red = redData[i];
-      const nir = nirData[i];
-      const sum = nir + red;
+      // Sentinel-2 L2A PB 04.00+ has an offset of -1000. 
+      // DN 1000 = 0 reflectance. Compute actual relative reflectance (ignoring 10000 scale).
+      const redDN = redData[i];
+      const nirDN = nirData[i];
 
       // Handle nodata (typically 0 in both bands)
-      if (red === 0 && nir === 0) {
+      if (redDN === 0 && nirDN === 0) {
         pixels[i * 4 + 3] = 0; // fully transparent
         continue;
       }
+
+      const red = Math.max(0, redDN - 1000);
+      const nir = Math.max(0, nirDN - 1000);
+      const sum = nir + red;
 
       const ndvi = sum > 0 ? (nir - red) / sum : 0;
       const [r, g, b, a] = ndviToRGBA(ndvi);
@@ -212,14 +240,9 @@ async function loadNDVI() {
     const computeMs = (performance.now() - computeT0).toFixed(0);
     ctx.putImageData(imageData, 0, 0);
 
-    // Use the STAC item bbox (EPSG:4326) for geographic placement
-    const [west, south, east, north] = getSceneBBox(scene);
-    const coordinates = [
-      [west, north],  // top-left
-      [east, north],  // top-right
-      [east, south],  // bottom-right
-      [west, south],  // bottom-left
-    ];
+    // Calculate precise geographic corners to fix distortion/alignment natively
+    setStatus(`Aligning projection…`);
+    const coordinates = await getProjectedCoordinates(redImage);
 
     // Add as image source to MapLibre
     map.addSource(sourceId, {
