@@ -1,0 +1,156 @@
+---
+title: "Computing NDVI on the Edge with WebGL"
+description: "Fetch Sentinel-2 imagery via STAC, decode Cloud Optimized GeoTIFFs in the browser, compute NDVI per-pixel, and render the result over an interactive map — all client-side."
+pubDate: "2026-04-01"
+---
+import NDVIMap from '../../components/NDVIMap.astro';
+
+The **Normalized Difference Vegetation Index (NDVI)** is one of the most widely used remote sensing indices. It quantifies vegetation health by exploiting the fact that healthy plants reflect near-infrared light (NIR) much more strongly than visible red light.
+
+```
+NDVI = (NIR − Red) / (NIR + Red)
+```
+
+Values range from **-1** (water, deep shadow) through **0** (bare soil) to **+1** (dense, healthy vegetation). In this tutorial we compute it entirely in the browser — no backend, no cloud functions, no API keys.
+
+---
+
+## The Architecture
+
+Our pipeline runs four stages, all on the client:
+
+1. **STAC Search** — Query the [Element84 Earth Search](https://earth-search.aws.element84.com/v1) catalog to find the latest Sentinel-2 L2A scene covering the current map viewport with less than 20% cloud cover.
+2. **COG Fetch** — Extract the Red (B04) and NIR (B08) asset URLs. These are Cloud Optimized GeoTIFFs hosted on AWS S3. The browser fetches only the byte ranges it needs via HTTP Range Requests.
+3. **NDVI Compute** — Read both bands into `Float32Array` buffers and compute NDVI per-pixel.
+4. **Render** — Map each NDVI value to a color using a diverging ramp and paint the result as an image layer on a MapLibre map.
+
+---
+
+## Live Demo
+
+The map below is centered on **Casa de Campo, Madrid** — one of the largest urban parks in Europe. Pan and zoom, and the pipeline will re-execute automatically.
+
+<NDVIMap />
+
+---
+
+## Step 1: Searching the STAC Catalog
+
+The [SpatioTemporal Asset Catalog (STAC)](https://stacspec.org/) is a standardized way to describe geospatial data. Element84 hosts a public STAC API covering Sentinel-2 L2A imagery on AWS.
+
+We send a `POST` request with the map's bounding box and a cloud cover filter:
+
+```js
+const response = await fetch('https://earth-search.aws.element84.com/v1/search', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    collections: ['sentinel-2-l2a'],
+    bbox: [west, south, east, north],
+    limit: 1,
+    sortby: [{ field: 'properties.datetime', direction: 'desc' }],
+    query: { 'eo:cloud_cover': { lte: 20 } },
+  }),
+});
+const { features } = await response.json();
+const scene = features[0];
+```
+
+The response includes asset URLs for every spectral band. We need two:
+- **`scene.assets.red.href`** → Band 4 (Red, 665nm)
+- **`scene.assets.nir.href`** → Band 8 (NIR, 842nm)
+
+---
+
+## Step 2: Decoding Cloud Optimized GeoTIFFs
+
+A [Cloud Optimized GeoTIFF (COG)](https://www.cogeo.org/) is internally tiled and structured so that HTTP Range Requests can fetch only the needed bytes. The `geotiff.js` library handles this transparently:
+
+```js
+import { fromUrl } from 'geotiff';
+
+const [redTiff, nirTiff] = await Promise.all([
+  fromUrl(scene.assets.red.href),
+  fromUrl(scene.assets.nir.href),
+]);
+
+const [redImage, nirImage] = await Promise.all([
+  redTiff.getImage(),
+  nirTiff.getImage(),
+]);
+
+// Read at a target resolution for performance
+const [redRaster, nirRaster] = await Promise.all([
+  redImage.readRasters({ width: 1024, height: 1024, samples: [0] }),
+  nirImage.readRasters({ width: 1024, height: 1024, samples: [0] }),
+]);
+```
+
+Key performance detail: we request `width` and `height` parameters, so `geotiff.js` leverages the COG's internal overviews to avoid decoding full-resolution data.
+
+---
+
+## Step 3: Computing NDVI
+
+With both bands as typed arrays, the NDVI computation is trivially fast — a single loop over the pixels:
+
+```js
+const red = redRaster[0]; // Float32Array
+const nir = nirRaster[0]; // Float32Array
+
+for (let i = 0; i < red.length; i++) {
+  const sum = nir[i] + red[i];
+  const ndvi = sum > 0 ? (nir[i] - red[i]) / sum : 0;
+
+  // Map to color ramp
+  const [r, g, b, a] = ndviToRGBA(ndvi);
+  pixels[i * 4]     = r;
+  pixels[i * 4 + 1] = g;
+  pixels[i * 4 + 2] = b;
+  pixels[i * 4 + 3] = a;
+}
+```
+
+On a modern machine this loop typically completes in **under 10ms** for a 1024×1024 image. The bottleneck is always the network fetch, not the computation.
+
+---
+
+## Step 4: The Color Ramp
+
+Our color ramp maps NDVI values to a diverging palette:
+
+```js
+const STOPS = [
+  { val: -1.0, r: 44,  g: 64,  b: 114 },  // deep blue  (water)
+  { val: -0.2, r: 140, g: 100, b: 60  },  // brown      (bare soil)
+  { val:  0.0, r: 210, g: 190, b: 140 },  // tan
+  { val:  0.2, r: 180, g: 210, b: 80  },  // yellow-green
+  { val:  0.4, r: 100, g: 180, b: 50  },  // light green
+  { val:  0.6, r: 40,  g: 140, b: 30  },  // green
+  { val:  0.8, r: 10,  g: 100, b: 20  },  // dark green
+  { val:  1.0, r: 0,   g: 60,  b: 10  },  // very dark green
+];
+```
+
+We linearly interpolate between adjacent stops. The ramp is designed to be perceptually uniform — equal changes in NDVI produce equal perceived changes in color.
+
+---
+
+## Performance Notes
+
+The total pipeline time is dominated by the **COG network fetch**. In our profiling from earlier work on this project:
+
+| Phase     | Typical Time | Notes |
+|-----------|-------------|-------|
+| STAC search | ~400ms | Single HTTP POST |
+| COG fetch   | 3–15s  | HTTP Range Requests to S3 (parallel) |
+| NDVI compute | &lt;10ms | Pure CPU loop over Float32Arrays |
+| Canvas render | &lt;5ms | `putImageData` + MapLibre image source |
+
+> The WASM approach from our earlier Zola-based blog achieved similar compute times (~5ms). The JavaScript loop shown here is comparably fast because modern V8/SpiderMonkey JIT-compile tight numeric loops very efficiently. WebAssembly would only provide marginal improvement for this specific workload.
+
+---
+
+## What's Next
+
+In the [next tutorial](/tutorials/02-edge-tree-detection), we take this a step further: instead of a simple arithmetic formula, we run a full **YOLO deep learning model** for tree detection directly in the browser using WebGPU and ONNX Runtime Web.

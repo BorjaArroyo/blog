@@ -1,0 +1,107 @@
+---
+/**
+ * NDVIMap — Astro island component
+ *
+ * Renders a MapLibre map container and loads the NDVI computation
+ * pipeline entirely client-side. All heavy work (STAC search,
+ * COG fetch, NDVI compute) happens in the browser.
+ */
+---
+
+<div class="ndvi-wrapper">
+  <div id="ndvi-map" class="map-container" aria-label="Interactive NDVI map"></div>
+  <div id="ndvi-status" class="status-overlay" data-type="info">Initializing…</div>
+  <div class="ndvi-legend">
+    <span class="legend-label">−1</span>
+    <div class="legend-gradient"></div>
+    <span class="legend-label">+1</span>
+  </div>
+</div>
+
+<style>
+  .ndvi-wrapper {
+    position: relative;
+    margin: 2.5rem 0;
+  }
+
+  .map-container {
+    width: 100%;
+    height: 520px;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    background: #1a1c23;
+  }
+
+  .status-overlay {
+    position: absolute;
+    bottom: 56px;
+    left: 12px;
+    z-index: 10;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-family: 'Menlo', 'Monaco', monospace;
+    font-size: 0.75rem;
+    color: #a7f3d0;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    max-width: calc(100% - 24px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: opacity 0.3s ease;
+  }
+
+  .status-overlay[data-type="error"] {
+    color: #fca5a5;
+    border-color: rgba(239, 68, 68, 0.3);
+  }
+
+  .ndvi-legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: absolute;
+    bottom: 16px;
+    left: 12px;
+    z-index: 10;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-family: 'Menlo', 'Monaco', monospace;
+    font-size: 0.65rem;
+    color: rgba(255, 255, 255, 0.7);
+  }
+
+  .legend-gradient {
+    width: 120px;
+    height: 10px;
+    border-radius: 5px;
+    background: linear-gradient(
+      to right,
+      rgb(44, 64, 114),
+      rgb(140, 100, 60),
+      rgb(210, 190, 140),
+      rgb(220, 210, 120),
+      rgb(180, 210, 80),
+      rgb(100, 180, 50),
+      rgb(40, 140, 30),
+      rgb(10, 100, 20),
+      rgb(0, 60, 10)
+    );
+  }
+
+  .legend-label {
+    user-select: none;
+  }
+</style>
+
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.1.0/dist/maplibre-gl.css" />
+<script>
+  import '../scripts/ndvi-map.js';
+</script>
